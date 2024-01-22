@@ -10,11 +10,11 @@ func ParseAndRun() {
 	args := os.Args[1:]
 
 	if args[0] == "--server" {
-		p.Setup("server")
+		// p.Setup("server")
 	} else if args[0] == "--client" {
-		p.Setup("client")
+		// p.Setup("client")
 	} else {
-		p.Setup(args[0])
+		p.Setup(args[0], args[1])
 	}
 
 }

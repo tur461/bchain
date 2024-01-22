@@ -1,11 +1,14 @@
 package network
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 	"net"
-	"net/http"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -23,10 +26,16 @@ const (
 	PingPeriod = (pongWait * 9) / 10
 
 	maxMessageSize = 512
+
+	minPortRange = 8000
+
+	maxPortRange = 8010
 )
 
 type Client struct {
-	conn *websocket.Conn
+	hub *Hub
+
+	conn net.Conn
 
 	send chan []byte
 }
@@ -40,10 +49,9 @@ type IPeer interface {
 	setup(string)
 }
 
-func (p Peer) Setup(a string) {
+func (p Peer) Setup(listen, serve string) {
 	var ch chan int
-	fmt.Println(a)
-	go setupWsServer(a)
+	go setupWsServer(listen, serve)
 	// if a == "server" {
 	// 	go setupServer()
 	// } else {
@@ -69,50 +77,129 @@ func setupClient() {
 
 }
 
-func setupWsServer(a string) {
-	fmt.Println("Listing at", a)
-	http.HandleFunc("/ws", wsEndpoint)
-	log.Fatal(http.ListenAndServe(":"+a, nil))
+func setupWsServer(listenPort string, acceptPort string) {
+	l, _ := strconv.Atoi(listenPort)
+	a, _ := strconv.Atoi(acceptPort)
+	if l > maxPortRange ||
+		l < minPortRange ||
+		a > maxPortRange ||
+		a < minPortRange {
+		log.Fatal(errors.New("port range excedded"))
+	}
+	// fmt.Println("listening at", listenPort)
+
+	go wsEndpoint(listenPort, acceptPort)
+	// http.HandleFunc("/ws", wsEndpoint)
+	// log.Fatal(listenWs(listenPort))
 }
 
-func wsEndpoint(w http.ResponseWriter, r *http.Request) {
-	upgrader.CheckOrigin = func(r *http.Request) bool { return true }
+func acceptWs(port string) {
+	// http.(":"+port, nil)
+}
 
-	ws, err := upgrader.Upgrade(w, r, nil)
+func listenWs(port string) error {
+	fmt.Println("Server running on port: " + port + " ..")
+	ln, err := net.Listen("tcp", ":"+port)
 	if err != nil {
 		fmt.Println(err)
-		return
+		return err
 	}
-	log.Println("Connection established")
-	client := &Client{conn: ws, send: make(chan []byte, 256)}
-	go client.writePump()
-	go client.readPump()
+	hub := newHub()
+	go hub.run()
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			fmt.Println(err)
+			continue
+		}
+		client := &Client{hub: hub, conn: conn, send: make(chan []byte, 256)}
+		// go handleConnection(conn)
+		go client.readPump()
+	}
+}
+
+// func wsEndpoint(w http.ResponseWriter, r *http.Request) {
+func wsEndpoint(listen, p string) {
+	var client *Client
+	// upgrader.CheckOrigin = func(r *http.Request) bool { return true }
+
+	// ws, err := upgrader.Upgrade(w, r, nil)
+	// if err != nil {
+	// 	fmt.Println(err)
+	// 	return
+	// }
+	// log.Println("Connection established")
+	hub := newHub()
+	go hub.run()
+	port, _ := strconv.Atoi(p)
+	l, _ := strconv.Atoi(listen)
+	counter := 0
+	for {
+		counter++
+		if port == l {
+			continue
+		}
+		if counter == 10 {
+			break
+		}
+		sPort := strconv.Itoa(port)
+		fmt.Println(sPort)
+		conn, err := net.Dial("tcp", "localhost:"+sPort)
+		if err != nil {
+			port++
+			if port > maxPortRange {
+				port = minPortRange
+			}
+			continue
+		}
+		fmt.Println("got the connection :D" + sPort)
+		client = &Client{hub: hub, conn: conn, send: make(chan []byte, 256)}
+		go client.writePump()
+		// go client.readPump()
+	}
+	go listenWs(listen)
+	//
 }
 
 func (c *Client) readPump() {
 	defer func() {
+		c.hub.unregister <- c
 		c.conn.Close()
 	}()
-	c.conn.SetReadLimit(maxMessageSize)
+	// c.conn.SetReadLimit(maxMessageSize)
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
-	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(pongWait))
-		return nil
-	})
+	// c.conn.SetPongHandler(func(string) error {
+	// 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	// 	return nil
+	// })
+	if err := func() error {
+		err := c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return err
+	}(); err != nil {
+		fmt.Println(err)
+		return
+	}
+	result := make([]byte, maxMessageSize)
 	for {
-		_, message, err := c.conn.ReadMessage()
+		_, err := c.conn.Read(result)
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				fmt.Println("error %v", err)
 			}
+			c.conn.Close()
+			fmt.Println("connected peer lost")
+			return
 		}
 
-		message = bytes.TrimSpace(bytes.Replace(message, []byte{'\n'}, []byte{' '}, -1))
-		fmt.Println(message)
+		result = bytes.TrimSpace(bytes.Replace(result, []byte{'\n'}, []byte{' '}, -1))
+		c.hub.broadcast <- result
+		fmt.Println(string(result))
 	}
 }
 
 func (c *Client) writePump() {
+	stdReader := bufio.NewReader(os.Stdin)
+	// fmt.Println("got the connection :D")
 	ticker := time.NewTicker(PingPeriod)
 	defer func() {
 		ticker.Stop()
@@ -120,36 +207,32 @@ func (c *Client) writePump() {
 	}()
 
 	for {
+		fmt.Print("> ")
+		sendData, err := stdReader.ReadString('\n')
+		if err != nil {
+			fmt.Println("Error reading from stdin")
+			panic(err)
+		}
+		c.send <- []byte(sendData)
 		select {
 		case message, ok := <-c.send:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				c.conn.Write([]byte("not able to sent message"))
 				return
 			}
-
-			w, err := c.conn.NextWriter(websocket.TextMessage)
-			if err != nil {
-				return
-			}
-			w.Write(message)
-
-			n := len(c.send)
-
-			for i := 0; i < n; i++ {
-				w.Write([]byte{'\n'})
-				w.Write(<-c.send)
-			}
-
-			if err := w.Close(); err != nil {
-				return
-			}
+			fmt.Println("sending " + string(message) + " ..")
+			c.conn.Write(message)
 
 		case <-ticker.C:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			if _, err := c.conn.Write([]byte("ping controll message")); err != nil {
 				return
 			}
+		default:
+			defer func() error {
+				return c.conn.Close()
+			}()
 		}
 	}
 }
@@ -174,7 +257,7 @@ func setupServer() {
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	buf := make([]byte, 1024)
+	buf := make([]byte, maxMessageSize)
 	_, err := conn.Read(buf)
 	if err != nil {
 		fmt.Println(err)
@@ -182,4 +265,5 @@ func handleConnection(conn net.Conn) {
 	}
 
 	fmt.Printf("Recieved %s", buf)
+
 }
